@@ -63,8 +63,8 @@ class AppendFrequencyMaps(torch.nn.Module):
                  localvar_window=7, robust_pct=0.99):
         super().__init__()
         self.maps = tuple(maps)
-        self.k = localvar_window
-        self.robust_pct = robust_pct
+        self.k = localvar_window      # the local-variance window size 
+        self.robust_pct = robust_pct  # upper quantile used for robust normalization, 99th percentile → reduces outlier influence
 
         # Fixed 3x3 kernels (registered as buffers for device/precision moves)
         sobel_x = torch.tensor([[[-1,0,1],[-2,0,2],[-1,0,1]]], dtype=torch.float32)
@@ -351,6 +351,23 @@ class FedeNetTiny(nn.Module):
         return logit
 
 
+class NormalizeRGBOnly(nn.Module):
+    """Normalize only the first 3 channels (RGB); leave extra channels unchanged."""
+    def __init__(self, mean, std):
+        super().__init__()
+        mean = torch.tensor(mean, dtype=torch.float32).view(3,1,1)
+        std  = torch.tensor(std,  dtype=torch.float32).view(3,1,1)
+        # buffers make it device-safe and picklable
+        self.register_buffer("mean", mean)
+        self.register_buffer("std",  std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rgb = (x[:3] - self.mean) / self.std
+        if x.shape[0] > 3:
+            return torch.cat([rgb, x[3:]], dim=0)
+        return rgb
+    
+    
 # ---
 # --- Hybrid init: copy RGB stem weights from a pretrained backbone into FedeNetTiny ---
 # ---
