@@ -1,9 +1,19 @@
 """
-FedeNet — A lightweight CNN designed for binary classification (flip vs notflip images)
+FedeNet — A lightweight CNN for binary classification (flip vs notflip)
 integrating fixed frequency maps and blur sensitivity at the input level.
 
-author: Federico Bessi (federico@bessi.dev)
+Author: Federico Bessi (federico@bessi.dev)
 """
+__version__ = "0.1.0"
+
+
+__all__ = [
+    "TARGET_H", "TARGET_W",
+    "ResizePad", "AppendFrequencyMaps", "NormalizeRGBOnly",
+    "BlurPool2d", "StemAA", "DWConvBlock", "TinyResidual",
+    "SpatialStream", "FrequencyStream", "FedeHead", "FedeNetTiny",
+    "load_rgb_pretrained_into_fedenet",
+]
 
 
 # ================================
@@ -15,8 +25,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
 import torchvision.transforms.functional as TF
-import numpy as np
+from torchvision import models
 
+from typing import Tuple, Union, Sequence
 
 # ================================
 # Global Constants
@@ -30,19 +41,30 @@ TARGET_H, TARGET_W = 540, 960   # keep multiples of 32
 # Transform Utilities
 # ================================
 class ResizePad:
-    """Resize preserving aspect ratio, then pad to (TARGET_H, TARGET_W)."""
+    """Resize preserving aspect ratio, then pad to (out_h, out_w).
+    Accepts PIL.Image or CHW Tensor in [0,1] or [0,255]."""
     def __init__(self, out_h=TARGET_H, out_w=TARGET_W, fill=0):
-        self.out_h = out_h
-        self.out_w = out_w
-        self.fill = fill
+        self.out_h = int(out_h)
+        self.out_w = int(out_w)
+        self.fill = int(fill)
                 
     def __call__(self, img: Image.Image):
+        # to PIL for consistent resize+pad behavior
+        if torch.is_tensor(img):
+            if img.ndim == 3 and img.shape[0] in (1,3):  # CHW -> HWC
+                img = TF.to_pil_image(img.clamp(0, 1) if img.max() <= 1.0 else img.byte())
+            else:
+                raise TypeError("ResizePad expects PIL.Image or CHW tensor with C=1 or 3")
+            
         w, h = img.size
         scale = min(self.out_w / w, self.out_h / h)
         new_w, new_h = int(w * scale), int(h * scale)  
         img = TF.resize(img, [new_h, new_w], antialias=True)
+        
         pad_w = self.out_w - new_w  # considering that all the dataset images are 1080x1920, no need of padding!
         pad_h = self.out_h - new_h  # we will keep these lines of code for more general applications 
+        if pad_w < 0 or pad_h < 0:
+            raise ValueError("Negative padding computed. Check target size and input.")
         
         # Pad evenly (left, top, right, bottom)
         pad_left  = pad_w // 2
@@ -104,7 +126,7 @@ class AppendFrequencyMaps(torch.nn.Module):
 
     def _local_variance(self, g1):
         # g1: (1,1,H,W) in [0,1]; window k (odd)
-        k = self.k
+        k = int(self.k)
         pad = k // 2
         w = torch.ones((1,1,k,k), device=g1.device, dtype=g1.dtype) / (k*k)
         mu  = nnF.conv2d(g1, w, padding=pad)
@@ -223,7 +245,7 @@ class StemAA(nn.Module):
         return x
         
 
-# Depthwise-Separable Block (lightweight)
+
 class DWConvBlock(nn.Module):
     """
     Depthwise 3x3 + Pointwise 1x1 + BN + SiLU
@@ -244,7 +266,7 @@ class DWConvBlock(nn.Module):
         x = self.bn(x)
         return self.act(x)
 
-# Tiny Residual wrapper (optional)
+
 class TinyResidual(nn.Module):
     """Optional residual if shapes match; otherwise acts as identity."""
     def __init__(self, ch):
@@ -261,7 +283,7 @@ class TinyResidual(nn.Module):
     def forward(self, x):
         return x + self.block(x)
 
-# Spatial Stream
+
 class SpatialStream(nn.Module):
     """
     Very small stack; only 2 downsamples total (including stem’s /2).
@@ -285,7 +307,7 @@ class SpatialStream(nn.Module):
     def forward(self, x):
         return self.stage(x)  # (B,64,H/4,W/4)
 
-# Frequency Stream
+
 class FrequencyStream(nn.Module):
     """
     Input must be the *same* tensor from stem (mixed RGB+freq already).
@@ -307,7 +329,7 @@ class FrequencyStream(nn.Module):
         x = self.dw(x)
         return x  # (B,8,H/4,W/4)
 
-# Head
+
 class FedeHead(nn.Module):
     """
     Late concat (spatial 64 + freq 8 = 72) -> GAP -> small MLP -> 1 logit
@@ -323,6 +345,7 @@ class FedeHead(nn.Module):
         )
         nn.init.kaiming_normal_(self.mlp[0].weight, nonlinearity="relu")
         nn.init.zeros_(self.mlp[0].bias)
+        nn.init.normal_(self.mlp[3].weight, std=1e-3)
         nn.init.zeros_(self.mlp[3].bias)
 
     def forward(self, x_spatial, x_freq):
@@ -330,11 +353,16 @@ class FedeHead(nn.Module):
         x = self.pool(x).flatten(1)               # (B,72)
         return self.mlp(x)                        # (B,1)
 
-# FedeNet (tiny)
+
 class FedeNetTiny(nn.Module):
-    """
-    End-to-end: StemAA -> SpatialStream + FrequencyStream -> FedeHead
-    Keeps params & FLOPs low while leveraging blur-sensitive cues.
+    """End-to-end: StemAA -> SpatialStream + FrequencyStream -> FedeHead.
+
+    Args:
+        in_ch: Number of input channels (3 + K frequency maps).
+
+    Shape:
+        Input: (B, in_ch, H, W)
+        Output: (B, 1) logits
     """
     def __init__(self, in_ch):
         super().__init__()
@@ -362,17 +390,21 @@ class NormalizeRGBOnly(nn.Module):
         self.register_buffer("std",  std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError("NormalizeRGBOnly expects CHW tensor (per-image).")
         rgb = (x[:3] - self.mean) / self.std
-        if x.shape[0] > 3:
-            return torch.cat([rgb, x[3:]], dim=0)
-        return rgb
-    
-    
-# ---
-# --- Hybrid init: copy RGB stem weights from a pretrained backbone into FedeNetTiny ---
-# ---
+        return torch.cat([rgb, x[3:]], dim=0) if x.shape[0] > 3 else rgb
 
-from torchvision import models
+
+def create_fedenet_tiny(freq_maps=("sobel","laplacian","highpass","localvar")):
+    """Convenience: returns a FedeNetTiny model configured for the given frequency maps."""
+    in_ch = 3 + len(freq_maps)
+    return FedeNetTiny(in_ch=in_ch)
+
+
+# ================================================================================================
+# Hybrid init: copy RGB stem weights from a pretrained backbone into FedeNetTiny
+# ================================================================================================
 
 def load_rgb_pretrained_into_fedenet(model: torch.nn.Module,
                                      backbone: str = "efficientnet_b0",
@@ -383,6 +415,8 @@ def load_rgb_pretrained_into_fedenet(model: torch.nn.Module,
     The extra 4 channels are random-initialized (small std).
     """
     model.to(device)
+    if not hasattr(model, "stem") or not hasattr(model.stem, "conv"):
+        raise AttributeError("Model is missing 'stem.conv' to receive pretrained weights.")
 
     # Get a pretrained backbone and locate its first conv
     if backbone == "efficientnet_b0":
