@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as nnF
 import torchvision.transforms.functional as TF
 from torchvision import models
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 
 from typing import Tuple, Union, Sequence
 
@@ -61,8 +62,8 @@ class ResizePad:
         new_w, new_h = int(w * scale), int(h * scale)  
         img = TF.resize(img, [new_h, new_w], antialias=True)
         
-        pad_w = self.out_w - new_w  # considering that all the dataset images are 1080x1920, no need of padding!
-        pad_h = self.out_h - new_h  # we will keep these lines of code for more general applications 
+        pad_w = self.out_w - new_w  
+        pad_h = self.out_h - new_h  
         if pad_w < 0 or pad_h < 0:
             raise ValueError("Negative padding computed. Check target size and input.")
         
@@ -396,6 +397,17 @@ class NormalizeRGBOnly(nn.Module):
         return torch.cat([rgb, x[3:]], dim=0) if x.shape[0] > 3 else rgb
 
 
+class NormalizeRGBOnlyBatch(nn.Module):
+    """Normalize only the first 3 channels (RGB). Leave extra channels unchanged. For batch treatment"""
+    def __init__(self, mean, std):
+        super().__init__()
+        self.register_buffer("mean", torch.tensor(mean).view(1,3,1,1))
+        self.register_buffer("std",  torch.tensor(std).view(1,3,1,1))
+    def forward(self, x):  # (B,C,H,W)
+        x[:, :3] = (x[:, :3] - self.mean) / self.std
+        return x
+
+
 def create_fedenet_tiny(freq_maps=("sobel","laplacian","highpass","localvar")):
     """Convenience: returns a FedeNetTiny model configured for the given frequency maps."""
     in_ch = 3 + len(freq_maps)
@@ -406,68 +418,66 @@ def create_fedenet_tiny(freq_maps=("sobel","laplacian","highpass","localvar")):
 # Hybrid init: copy RGB stem weights from a pretrained backbone into FedeNetTiny
 # ================================================================================================
 
-def load_rgb_pretrained_into_fedenet(model: torch.nn.Module,
-                                     backbone: str = "efficientnet_b0",
-                                     device: torch.device = torch.device("cpu")):
+@torch.no_grad()
+def load_rgb_pretrained_into_fedenet(
+    model: torch.nn.Module,
+    backbone: str = "efficientnet_b0",
+    device: str | torch.device | None = None,
+) -> None:
     """
-    Copies the pretrained 3->C_out stem conv weights (RGB only) from a torchvision backbone
-    into model.stem.conv (which expects 7 input channels).
-    The extra 4 channels are random-initialized (small std).
+    Load pretrained RGB convolution weights from a MobileNet/EfficientNet-style backbone
+    into FedeNet's RGB stem.
+
+    Parameters
+    ----------
+    model : nn.Module
+        An instance of FedeNetTiny or a compatible variant.
+    backbone : str, default="efficientnet_b0"
+        Backbone to extract weights from. Currently supports EfficientNet-B0.
+    device : str | torch.device | None, optional
+        Device where the weights will be loaded. If None, inferred from model parameters.
     """
-    model.to(device)
-    if not hasattr(model, "stem") or not hasattr(model.stem, "conv"):
-        raise AttributeError("Model is missing 'stem.conv' to receive pretrained weights.")
-
-    # Get a pretrained backbone and locate its first conv
-    if backbone == "efficientnet_b0":
-        try:
-            # Newer torchvision
-            b = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
-        except Exception:
-            # Older API fallback
-            b = models.efficientnet_b0(pretrained=True)
-        # EfficientNet-B0 first conv: features[0][0]
-        conv_rgb = b.features[0][0]  # Conv2d(3, 32, k=3, s=2, p=1)
-    elif backbone == "resnet18":
-        try:
-            b = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        except Exception:
-            b = models.resnet18(pretrained=True)
-        # ResNet18 first conv: conv1 (3,64,7x7). We’ll adapt if out_ch mismatches.
-        conv_rgb = b.conv1
-    else:
-        raise ValueError("backbone must be 'efficientnet_b0' or 'resnet18'")
-
-    w_rgb = conv_rgb.weight.data.to(device)   # shape: (C_out_pre, 3, k, k)
-
-    # Prepare FedeNet stem conv weight (C_out_fede, 7, k, k)
-    stem = model.stem
-    w_fede = stem.conv.weight.data            # (C_out_fede, 7, k, k)
-    C_out_fede, C_in_fede, kH, kW = w_fede.shape
-    assert C_in_fede == 7, f"Expected 7 input channels, got {C_in_fede}"
-
-    # If backbone out channels differ, project or slice to match FedeNet
-    #    For EfficientNet-B0: C_out_pre = 32 matches our 32 → perfect.
-    #    For ResNet18: C_out_pre = 64 → we take the first 32 filters (simple, effective).
-    if w_rgb.shape[0] != C_out_fede:
-        if w_rgb.shape[0] > C_out_fede:
-            w_rgb = w_rgb[:C_out_fede]
-        else:
-            # If backbone has fewer out channels (unlikely), pad with random filters
-            extra = torch.randn(C_out_fede - w_rgb.shape[0], 3, kH, kW, device=device) * 0.01
-            w_rgb = torch.cat([w_rgb, extra], dim=0)
-
-    # Build new FedeNet weight: copy RGB into [:, :3], random small init for the 4 extra chans
-    w_new = torch.zeros_like(w_fede)
-    w_new[:, :3, :, :] = w_rgb                      # pretrained RGB
-    w_new[:, 3:, :, :] = torch.randn(C_out_fede, 4, kH, kW, device=device) * 0.01  # new chans
-
-    # Assign back and keep training all layers (fine-tune)
-    with torch.no_grad():
-        stem.conv.weight.copy_(w_new)
     
-    # Quick sanity prints
-    print(f"[HybridInit] Loaded RGB weights from {backbone} → FedeNet stem.")
-    print(f"[HybridInit] Stem conv weight shape now: {stem.conv.weight.shape} (expects 7 input chans).")
+    backbone = backbone.lower()
+    if backbone not in {"efficientnet_b0", "effnet_b0"}:
+        raise ValueError(f"Unsupported backbone '{backbone}'. Only 'efficientnet_b0' is supported.")
+    
+    m = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+    
+    # Extract conv1 (RGB) weights
+    w_rgb = m.features[0][0].weight  # (32, 3, 3, 3)
+
+    # Determine device
+    if device is None:
+        device = next(model.parameters()).device
+    else:
+        device = torch.device(device)
+    
+    # Locate target conv
+    stem_conv = getattr(model, "stem", None)
+    if stem_conv is None or not hasattr(stem_conv, "conv_rgb"):
+        raise AttributeError("Expected model.stem.conv_rgb to exist (the RGB input conv).")
+
+    conv = stem_conv.conv_rgb
+    if conv.in_channels != 3 or conv.kernel_size != (3, 3):
+        raise ValueError(f"FedeNet stem must have Conv2d(in_channels=3, kernel_size=3). Got {conv}.")
+
+    # Align output channels
+    src_out, dst_out = w_rgb.shape[0], conv.weight.shape[0]
+    if src_out > dst_out:
+        w_rgb = w_rgb[:dst_out]
+        print(f"[FedeNet] Truncated EfficientNet conv1 weights: {src_out} -> {dst_out}")
+    elif src_out < dst_out:
+        reps = (dst_out + src_out - 1) // src_out
+        w_rgb = w_rgb.repeat(reps, 1, 1, 1)[:dst_out]
+        print(f"[FedeNet] Repeated EfficientNet conv1 weights: {src_out} -> {dst_out}")
+
+    # Copy weights to target device/dtype
+    conv.weight.copy_(w_rgb.to(device=device, dtype=conv.weight.dtype))
+    if conv.bias is not None:
+        conv.bias.zero_()
+
+    print(f"[FedeNet] Loaded RGB stem weights from {backbone} ({tuple(w_rgb.shape)}) on {device}")
+
 
 
