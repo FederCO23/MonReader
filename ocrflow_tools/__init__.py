@@ -6,6 +6,10 @@ from .ingest import (
 from .binarize import (
     binarize_variants, bin_metrics, choose_best, run_binarization_from_ingest
 )
+from .layout import (
+    segment_lines, run_layout_from_binarization
+)
+
 
 __all__ = [
     # common
@@ -15,4 +19,6 @@ __all__ = [
     "detect_main_text_bbox", "save_overlay", "process_image_folder",
     # binarize
     "binarize_variants", "bin_metrics", "choose_best", "run_binarization_from_ingest",
+    # layout
+    "segment_lines", "run_layout_from_binarization",
 ]

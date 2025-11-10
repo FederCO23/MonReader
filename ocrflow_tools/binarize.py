@@ -45,12 +45,58 @@ def bin_metrics(fg_white: np.ndarray) -> Dict[str, float]:
         "cc_p95_area": cc_p95,
     }
 
-def choose_best(cands: Dict[str, np.ndarray]) -> str:
-    """Prefer highest projection variance within a plausible foreground band."""
-    metrics = {k: bin_metrics(v) for k, v in cands.items()}
-    band = {k: m for k, m in metrics.items() if 0.03 <= m["fg_ratio"] <= 0.25}
+def _border_foreground_ratio(fg_white: np.ndarray, margin_frac: float = 0.06) -> float:
+    """
+    Fraction of foreground (white) inside left+right vertical margins.
+    Clean binarization => small value; noisy gutter/shading => large value.
+    """
+    H, W = fg_white.shape[:2]
+    m = max(1, int(W * margin_frac))
+    band = np.zeros_like(fg_white, dtype=bool)
+    band[:, :m] = True
+    band[:, -m:] = True
+    fg = (fg_white > 0)
+    if band.sum() == 0:
+        return 0.0
+    return float(fg[band].mean())
+
+def choose_best(cands: dict[str, np.ndarray]) -> str:
+    """
+    Score = proj_var / (1 + a*margin_ink + b*cc_median_area_norm + c*fg_penalty)
+    Higher score wins. Keeps a plausible fg_ratio band first.
+    """
+    # gather metrics
+    metrics = {}
+    for name, fg in cands.items():
+        m = bin_metrics(fg)  # fg_ratio, proj_var, cc_count, cc_median_area, cc_p95_area
+        m["margin_ink"] = _border_foreground_ratio(fg)  # new
+        metrics[name] = m
+
+    # keep plausible foreground band
+    band = {k: v for k, v in metrics.items() if 0.03 <= v["fg_ratio"] <= 0.25}
     pool = band if band else metrics
-    best = max(pool.items(), key=lambda kv: kv[1]["proj_var"])[0]
+
+    # normalize per-pool to keep scales comparable
+    def _norm(key):
+        vals = np.array([m[key] for m in pool.values()], dtype=float)
+        vmin, vmax = float(vals.min()), float(vals.max())
+        return {k: 0.0 if vmax == vmin else (metrics[k][key] - vmin) / (vmax - vmin) for k in pool.keys()}
+
+    proj_var_n = _norm("proj_var")            # higher is better
+    cc_med_n   = _norm("cc_median_area")      # lower is better
+    margin_n   = _norm("margin_ink")          # lower is better
+    fg_ratio_n = _norm("fg_ratio")            # prefer mid-range → use distance to 0.12 as penalty
+
+    # score with penalties
+    a, b, c = 3.0, 1.5, 1.0  # weights: margin, CC size, fg mid-range
+    scores = {}
+    for k in pool.keys():
+        fg_penalty = abs((metrics[k]["fg_ratio"] - 0.12)) / 0.12  # 0 at 12% ink, grows away from it
+        denom = (1.0 + a*margin_n[k] + b*cc_med_n[k] + c*fg_penalty)
+        scores[k] = (1e-6 + proj_var_n[k]) / denom  # small epsilon for safety
+
+    # pick best
+    best = max(scores.items(), key=lambda kv: kv[1])[0]
     return best
 
 def run_binarization_from_ingest(ingest_csv: Path, out_root: Path):
