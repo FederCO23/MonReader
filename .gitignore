@@ -1,0 +1,34 @@
+# Project Artifacts
+/checkpoints/
+/fedetenet_graph/
+
+# Training logs at repo root
+/train_history.json
+
+# Python
+__pycache__/
+/**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE / editor
+*.code-workspace
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Archives / local bundles
+ocrflow_tools.zip
+
+# Model weights (if ever stored outside checkpoints/)
+*.pth
+*.onnx
+
+
