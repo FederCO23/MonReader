@@ -147,3 +147,75 @@ def already_done(txt_out: Path, json_out: Path):
     return txt_out.exists() and txt_out.stat().st_size > 0 and json_out.exists() and json_out.stat().st_size > 0
 
 
+# Part 4 helper functions:
+
+# Step I.2 — Explicit verification of page ordering
+# Page filenames like "pag2.JPEG" vs "pag10.JPEG" will sort incorrectly with plain string sorting.
+# Here we define an explicit "natural sort" that extracts the numeric page id and sorts by it.
+
+
+BASE = Path.cwd()
+WORK_DIR = BASE / "work"
+
+# OCR outputs from Part 3
+STEPH_DIR = WORK_DIR / "stepH_qwen2p5vl_full"
+
+# Part 4 outputs
+STEP4_DIR = WORK_DIR / "step4_tts"
+
+
+def page_number_from_name(name: str) -> int:
+    """
+    Extracts the first integer from filenames like:
+      pag0.JPEG, pag2.jpeg, pag10.json, etc.
+    Returns a large number if no integer is found (so it goes last).
+    """
+    m = re.search(r"(\d+)", str(name))
+    return int(m.group(1)) if m else 10**12
+
+def list_pages_sorted(img_or_json_dir: Path, exts=(".JPEG", ".JPG", ".PNG", ".json", ".txt")):
+    """
+    Lists files in directory, filters by extension, and sorts by numeric page id.
+    """
+    files = [p for p in img_or_json_dir.iterdir() if p.is_file() and p.suffix.lower() in {e.lower() for e in exts}]
+    return sorted(files, key=lambda p: page_number_from_name(p.name))
+
+def verify_page_order(book_id: str, *, which: str = "json", preview: int = 30):
+    """
+    which: 'json' or 'images' or 'txt'
+    Prints the order and returns a dataframe with the computed page numbers.
+    """
+    base = STEPH_DIR / book_id
+    if which == "json":
+        d = base / "json"
+        exts = (".json",)
+    elif which == "txt":
+        d = base / "txt"
+        exts = (".txt",)
+    elif which == "images":
+        # if you want to verify original images order, point to your data/books/.../images instead
+        raise ValueError("Use which='json' or 'txt' here (Step H outputs). For images, pass your images dir directly.")
+    else:
+        raise ValueError("which must be one of: 'json', 'txt'.")
+
+    files = list_pages_sorted(d, exts=exts)
+    rows = [{"name": f.name, "page_n": page_number_from_name(f.name)} for f in files]
+    df = pd.DataFrame(rows).sort_values("page_n").reset_index(drop=True)
+
+    print(f"\n>>> {book_id} ({which})")
+    print(f"Directory: {d}")
+    print("Order preview:")
+    for n in df["name"].head(preview).tolist():
+        print(" -", n)
+
+    # quick sanity checks
+    if df["page_n"].isna().any():
+        print("WARNING: some files had no numeric page id.")
+    if df["page_n"].duplicated().any():
+        dups = df[df["page_n"].duplicated(keep=False)].sort_values("page_n")
+        print("WARNING: duplicated page numbers detected:")
+        display(dups)
+
+    return df
+
+
